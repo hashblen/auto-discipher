@@ -1,0 +1,27 @@
+[package]
+name = "auto-discipher"
+version = "1.0.0"
+edition = "2021"
+license = "MIT"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+base64 = "0.22"
+etherparse = "0.16.0"
+kcp = { git = "https://github.com/hashblen/mhy-kcp" }
+protobuf = "3.7.1"
+rand_mt = "4.2"
+tracing = "0.1"
+rsa = "0.9"
+
+[build-dependencies]
+protobuf-codegen = "3.7.1"
+
+[dev-dependencies]
+serde = { version = "1.0", features = ["derive"] }
+# preserve_order keeps the keys file in write order, which is what says which
+# build a key belongs to.
+serde_json = { version = "1.0", features = ["preserve_order"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
