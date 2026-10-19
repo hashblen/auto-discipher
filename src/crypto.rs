@@ -1,6 +1,6 @@
 use protobuf::Message;
 use rand_mt::Mt64;
-use tracing::{debug, instrument, trace, warn};
+use tracing::{debug, info, instrument, trace, warn};
 
 use crate::bytes_as_hex;
 use crate::cs_rand::Random;
@@ -36,7 +36,7 @@ pub fn new_key_from_seed(seed: u64) -> Vec<u8> {
 pub const MIN_ORACLE_BYTES: usize = 64;
 
 /// How far either side of the observed clock to look, in seconds.
-const SEARCH_WINDOW_SECONDS: i64 = 15;
+const SEARCH_WINDOW_SECONDS: i64 = 60;
 
 /// Reproduces the game's clock path bit-for-bit.
 ///
@@ -75,7 +75,7 @@ pub fn parses_with(body: &[u8], pad: &[u8]) -> bool {
 /// out on, accepting a candidate only when a quorum of the buffered packets
 /// agrees.
 pub fn bruteforce(sent_ms: u64, server_seed: u64, bodies: &[Vec<u8>]) -> Option<Vec<u8>> {
-    debug!("Running bruteforce loop.");
+    info!("Running bruteforce loop with ms: {sent_ms}");
 
     let base = (sent_ms / 1000) as i64;
     // Screen on the longest packet first: it discards almost every candidate for
