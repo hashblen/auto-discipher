@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use base64::prelude::{BASE64_STANDARD, BASE64_STANDARD_NO_PAD};
 use base64::Engine;
@@ -230,10 +230,9 @@ fn check_list(elements: &[&[u8]], catalogue: &Catalogue) -> Option<AchievementLi
         if observed.len() < MIN_ENTRIES {
             continue;
         }
-        let (xor_key, matched) = best_xor_key(observed, &catalogue.all);
-        if matched < observed.len() || xor_key >= MAX_XOR_KEY {
+        let Some(xor_key) = find_xor_key(observed, &catalogue.all) else {
             continue;
-        }
+        };
 
         let ids: Vec<u32> = observed.iter().map(|v| (v ^ xor_key) as u32).collect();
         // Ids are unique. This is what rejects the largest false positive: a
@@ -257,37 +256,40 @@ fn check_list(elements: &[&[u8]], catalogue: &Catalogue) -> Option<AchievementLi
     best
 }
 
-/// Recover the constant applied to a set of observed values.
+/// Recover the constant applied to a set of observed values: the key below
+/// [`MAX_XOR_KEY`] that maps every one of them onto a catalogue id.
 ///
-/// Vote rather than search the 32-bit space: every (observed, catalogue) pair
-/// implies one candidate key, so the true key collects a vote per entry.
-/// Candidates are then scored on actual matches rather than votes, because the
-/// catalogue is dense enough to give low-bit keys spurious votes -- key 4
-/// matches 57 of 65 entries while key 0 matches all 65.
-fn best_xor_key(observed: &[u64], ids: &HashSet<u32>) -> (u64, usize) {
-    let mut votes: HashMap<u64, usize> = HashMap::new();
-    for observed in observed {
-        for id in ids {
-            *votes.entry(observed ^ u64::from(*id)).or_default() += 1;
-        }
-    }
+/// Every value has to land on an id, so the first value alone narrows the
+/// candidates to one per id, and each is then checked against the rest. That is
+/// linear in the list, where voting over every (observed, id) pair and scoring
+/// each vote was quadratic: seconds per packet on an 800-entry list, during which
+/// the capture backs up.
+///
+/// Among keys that fit, the one landing on the most distinct ids wins, because
+/// the catalogue is dense enough that low-bit keys come close -- key 4 matches
+/// 57 of 65 entries while key 0 matches all 65.
+fn find_xor_key(observed: &[u64], ids: &HashSet<u32>) -> Option<u64> {
+    let first = *observed.first()?;
+    // Sorted so that a tie goes the same way on every run.
+    let candidates: BTreeSet<u64> = ids
+        .iter()
+        .map(|id| first ^ u64::from(*id))
+        .filter(|key| *key < MAX_XOR_KEY)
+        .collect();
 
-    let mut best = (0, 0, 0);
-    for key in votes.keys() {
-        let mut matched = 0;
+    let mut best: Option<(u64, usize)> = None;
+    for key in candidates {
         let mut distinct: HashSet<u32> = HashSet::new();
-        for observed in observed {
+        let all_match = observed.iter().all(|observed| {
             let id = (observed ^ key) as u32;
-            if ids.contains(&id) {
-                matched += 1;
-                distinct.insert(id);
-            }
-        }
-        if matched > best.1 || (matched == best.1 && distinct.len() > best.2) {
-            best = (*key, matched, distinct.len());
+            distinct.insert(id);
+            ids.contains(&id)
+        });
+        if all_match && best.map_or(true, |(_, most)| distinct.len() > most) {
+            best = Some((key, distinct.len()));
         }
     }
-    (best.0, best.1)
+    best.map(|(key, _)| key)
 }
 
 /// Read a list back out of a packet using a layout found earlier.
