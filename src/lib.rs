@@ -27,14 +27,18 @@
 //! let mut sniffer = GameSniffer::new();
 //! for packet in packets {
 //!     match sniffer.receive_packet(packet) {
-//!         Some(GamePacket::Connection(ConnectionPacket::Disconnected)) => {
+//!         Ok(Some(GamePacket::Connection(ConnectionPacket::Disconnected))) => {
 //!             println!("Disconnected!");
 //!             break;
 //!         }
-//!         Some(GamePacket::Commands(commands)) => {
+//!         Ok(Some(GamePacket::Commands(commands))) => {
 //!             for command in commands {
 //!                 println!("{:?}", command);
 //!             }
+//!         }
+//!         Err(error) => {
+//!             println!("{error}");
+//!             break;
 //!         }
 //!         _ => {}
 //!     }
@@ -44,7 +48,6 @@
 
 use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
-use protobuf::Message;
 use rsa::{pkcs1::DecodeRsaPrivateKey, RsaPrivateKey};
 use std::fmt;
 use std::fmt::Write;
@@ -52,8 +55,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::{debug, error, info, info_span, instrument, trace, warn};
 
 use crate::connection::parse_connection_packet;
-use crate::crypto::{bruteforce, xor_decrypt, MIN_ORACLE_BYTES};
-use crate::gen::protos::Unk;
+use crate::crypto::{bruteforce, parses_with, xor_decrypt, MIN_ORACLE_BYTES};
 use crate::kcp::KcpSniffer;
 use crate::unk_util::{
     decode_list, find_achievement_list, matches_get_player_token_rsp, Achievement, AchievementList,
@@ -202,6 +204,58 @@ pub enum Key {
 /// that is only reached when the search has failed for a while.
 const MAX_PENDING: usize = 8;
 
+/// Why the sniffer gave up on a connection.
+///
+/// The sniffer has reset itself by the time one of these is returned, so whatever
+/// follows starts from scratch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SniffError {
+    /// None of the initial keys fit the connection's first packets. Either the
+    /// game has a new key, or the capture started after the login.
+    InitialKeyMissing {
+        /// The version the packets asked for, where the game has such a thing.
+        version: Option<u32>,
+        /// Whether the connection's handshake was captured. Without it the
+        /// capture started late, and any version is just noise.
+        saw_handshake: bool,
+    },
+    /// The initial key stopped fitting, but no session seed was ever seen.
+    SessionSeedMissing,
+    /// A session seed was seen, but no key derived from it decrypts the traffic.
+    BruteforceFailed,
+    /// The session key stopped decrypting the traffic.
+    SessionKeyLost,
+}
+
+impl fmt::Display for SniffError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::InitialKeyMissing { version, saw_handshake } => write!(
+                f,
+                "no initial key found (version: {version:?}, handshake seen: {saw_handshake})"
+            ),
+            Self::SessionSeedMissing => write!(f, "no session seed found"),
+            Self::BruteforceFailed => write!(f, "could not bruteforce the session key"),
+            Self::SessionKeyLost => write!(f, "the session key stopped working"),
+        }
+    }
+}
+
+impl std::error::Error for SniffError {}
+
+/// Which key the sniffer is decrypting with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyState {
+    None,
+    Dispatch,
+    Session,
+}
+
+/// How many long packets in a row may fail before a key is given up on. Only
+/// packets of at least [`MIN_ORACLE_BYTES`] count, since shorter ones fail for
+/// good keys too.
+const MAX_KEY_FAILURES: u32 = 3;
+
 #[derive(Default)]
 pub struct GameSniffer {
     sent_kcp: Option<KcpSniffer>,
@@ -221,6 +275,8 @@ pub struct GameSniffer {
     catalogue: Catalogue,
     regular_list: Option<AchievementList>,
     arcade_list: Option<AchievementList>,
+    saw_handshake: bool,
+    key_failures: u32,
 }
 
 impl GameSniffer {
@@ -259,8 +315,32 @@ impl GameSniffer {
         self
     }
 
+    /// Forget the current connection, keeping the keys and the achievement ids the
+    /// sniffer was set up with.
+    pub fn reset(&mut self) {
+        self.recv_kcp = None;
+        self.sent_kcp = None;
+        self.key = None;
+        self.sent_time = None;
+        self.server_seed = 0;
+        self.pending.clear();
+        self.regular_list = None;
+        self.arcade_list = None;
+        self.saw_handshake = false;
+        self.key_failures = 0;
+    }
+
+    /// Which key the sniffer is decrypting with.
+    pub fn key_state(&self) -> KeyState {
+        match self.key {
+            None => KeyState::None,
+            Some(Key::Dispatch(_)) => KeyState::Dispatch,
+            Some(Key::Session(_)) => KeyState::Session,
+        }
+    }
+
     #[instrument(skip_all, fields(len = bytes.len()))]
-    pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Option<GamePacket> {
+    pub fn receive_packet(&mut self, bytes: Vec<u8>) -> Result<Option<GamePacket>, SniffError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|elapsed| elapsed.as_millis() as u64)
@@ -272,37 +352,45 @@ impl GameSniffer {
     /// clock the game stamped its request with comes from the capture rather
     /// than from the wall clock, so replaying a recording needs this instead.
     #[instrument(skip_all, fields(len = bytes.len()))]
-    pub fn receive_packet_at(&mut self, bytes: Vec<u8>, timestamp_ms: u64) -> Option<GamePacket> {
+    pub fn receive_packet_at(
+        &mut self,
+        bytes: Vec<u8>,
+        timestamp_ms: u64,
+    ) -> Result<Option<GamePacket>, SniffError> {
         self.timestamp_ms = timestamp_ms;
-        let packet = parse_connection_packet(&PORTS, bytes)?;
+        let result = self.process_packet(bytes);
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+
+    fn process_packet(&mut self, bytes: Vec<u8>) -> Result<Option<GamePacket>, SniffError> {
+        let Some(packet) = parse_connection_packet(&PORTS, bytes) else {
+            return Ok(None);
+        };
         match packet {
             ConnectionPacket::HandshakeRequested => {
                 // Everything scoped to the session is stale from here on: the
                 // keys, the seed, and whatever the detection concluded. Without
                 // this a reconnect would mix two sessions' packets together.
                 info!("handshake requested, resetting state");
-                self.recv_kcp = None;
-                self.sent_kcp = None;
-                self.key = None;
-                self.sent_time = None;
-                self.server_seed = 0;
-                self.pending.clear();
-                self.regular_list = None;
-                self.arcade_list = None;
-                Some(GamePacket::Connection(packet))
+                self.reset();
+                self.saw_handshake = true;
+                Ok(Some(GamePacket::Connection(packet)))
             }
             ConnectionPacket::HandshakeEstablished | ConnectionPacket::Disconnected => {
-                Some(GamePacket::Connection(packet))
+                Ok(Some(GamePacket::Connection(packet)))
             }
 
             ConnectionPacket::SegmentData(direction, kcp_seg) => {
-                let commands = self.receive_kcp_segment(direction, &kcp_seg);
-                match commands {
-                    Some(commands) => Some(GamePacket::Commands(commands)),
-                    None => Some(GamePacket::Connection(ConnectionPacket::SegmentData(
+                let commands = self.receive_kcp_segment(direction, &kcp_seg)?;
+                Ok(Some(match commands {
+                    Some(commands) => GamePacket::Commands(commands),
+                    None => GamePacket::Connection(ConnectionPacket::SegmentData(
                         direction, kcp_seg,
-                    ))),
-                }
+                    )),
+                }))
             }
         }
     }
@@ -311,28 +399,29 @@ impl GameSniffer {
         &mut self,
         direction: PacketDirection,
         kcp_seg: &[u8],
-    ) -> Option<Vec<GameCommand>> {
+    ) -> Result<Option<Vec<GameCommand>>, SniffError> {
         let kcp = match direction {
             PacketDirection::Sent => &mut self.sent_kcp,
             PacketDirection::Received => &mut self.recv_kcp,
         };
 
         if kcp.is_none() {
-            let new_kcp = KcpSniffer::try_new(kcp_seg)?;
+            let Some(new_kcp) = KcpSniffer::try_new(kcp_seg) else {
+                return Ok(None);
+            };
             *kcp = Some(new_kcp);
         }
 
         if let Some(kcp) = kcp {
-            let commands = kcp
-                .receive_segments(kcp_seg)
-                .into_iter()
-                .filter_map(|data| self.receive_command(data, direction))
-                .collect();
+            let mut commands = Vec::new();
+            for data in kcp.receive_segments(kcp_seg) {
+                commands.extend(self.receive_command(data, direction)?);
+            }
 
-            return Some(commands);
+            return Ok(Some(commands));
         }
 
-        None
+        Ok(None)
     }
 
     /// Read an achievement list out of a command.
@@ -383,79 +472,109 @@ impl GameSniffer {
         Some(achievements)
     }
 
+    /// Count a packet the current key can't decrypt, and give up on the connection
+    /// once `limit` have failed in a row.
+    fn key_failure<T>(&mut self, limit: u32, error: SniffError) -> Result<Option<T>, SniffError> {
+        self.key_failures += 1;
+        if self.key_failures >= limit {
+            return Err(error);
+        }
+        Ok(None)
+    }
+
     #[instrument(skip_all, fields(len = data.len()))]
     fn receive_command(
         &mut self,
         data: Vec<u8>,
         direction: PacketDirection,
-    ) -> Option<GameCommand> {
+    ) -> Result<Option<GameCommand>, SniffError> {
         // The request's timestamp seeds the key search. The response follows within
         // ~400ms and the search covers +/-15s, so either would do.
         if direction == PacketDirection::Sent && self.sent_time.is_none() {
             self.sent_time = Some(self.timestamp_ms);
         }
 
-        let mut command = GameCommand::try_new(data.clone())?;
-        let key_r = match &self.key {
+        let Some(mut command) = GameCommand::try_new(data) else {
+            return Ok(None);
+        };
+
+        // The login burst has short frames that are not protobufs, so a failure on
+        // one says nothing about the key, and a success (an empty body always
+        // parses) says just as little. Without a key there's nothing to do with
+        // them, and with one they are at most passed along.
+        let is_oracle = command.proto_data.len() >= MIN_ORACLE_BYTES;
+
+        let key = match &self.key {
             None => {
-                let mut found_key: Option<Vec<u8>> = None;
+                if !is_oracle {
+                    return Ok(None);
+                }
+
                 // Shipped keys are tried newest first and the one that yields a
                 // decodable message wins.
-                for k in self.initial_keys.iter().rev() {
-                    let mut test = command.proto_data.clone();
-                    xor_decrypt(k, &mut test);
-
-                    if Unk::parse_from_bytes(&test).is_ok() {
-                        found_key = Some(k.clone());
-                        break;
-                    }
-                }
+                let found_key = self
+                    .initial_keys
+                    .iter()
+                    .rev()
+                    .find(|k| parses_with(&command.proto_data, k))
+                    .cloned();
 
                 match found_key {
                     Some(key) => {
-                        self.key = Some(Dispatch(key));
-                        self.key.as_ref().unwrap()
+                        self.key = Some(Dispatch(key.clone()));
+                        key
                     }
                     None => {
                         error!("No dispatch key found");
-                        return None;
+                        return self.key_failure(
+                            MAX_KEY_FAILURES,
+                            SniffError::InitialKeyMissing {
+                                version: None,
+                                saw_handshake: self.saw_handshake,
+                            },
+                        );
                     }
                 }
             }
-            Some(Dispatch(k)) => {
-                let mut test = command.proto_data.clone();
-                xor_decrypt(k, &mut test);
+            Some(Dispatch(k)) if parses_with(&command.proto_data, k) => k.clone(),
+            Some(Dispatch(_)) => {
+                if !is_oracle {
+                    return Ok(None);
+                }
 
-                if Unk::parse_from_bytes(&test).is_ok() {
-                    self.key.as_ref().unwrap()
-                } else {
-                    // The dispatch key stops decoding once the session key takes
-                    // over, which is what signals it is time to look for one.
-                    let pad = self.bruteforce(&command.proto_data)?;
-                    self.key = Some(Key::Session(pad));
-                    self.key.as_ref().unwrap()
+                if self.server_seed == 0 {
+                    error!("Dispatch key stopped working, but no session seed was seen");
+                    return self.key_failure(MAX_PENDING as u32, SniffError::SessionSeedMissing);
+                }
+
+                // The dispatch key stops decoding once the session key takes
+                // over, which is what signals it is time to look for one.
+                match self.bruteforce(&command.proto_data) {
+                    Some(pad) => {
+                        self.key = Some(Key::Session(pad.clone()));
+                        pad
+                    }
+                    // A full buffer means every candidate had its best chance.
+                    None if self.pending.len() >= MAX_PENDING => {
+                        error!("Couldn't bruteforce the session key");
+                        return Err(SniffError::BruteforceFailed);
+                    }
+                    None => return Ok(None),
                 }
             }
-            Some(Key::Session(k)) => {
-                let mut test = command.proto_data.clone();
-                xor_decrypt(k, &mut test);
-
-                if Unk::parse_from_bytes(&test).is_ok() {
-                    self.key.as_ref().unwrap()
-                } else {
-                    warn!("Invalidated session key");
-                    self.key = None;
-                    error!("Session key dead, relaunch game");
-                    return None;
+            Some(Key::Session(k)) if parses_with(&command.proto_data, k) => k.clone(),
+            Some(Key::Session(_)) => {
+                if !is_oracle {
+                    return Ok(None);
                 }
+
+                warn!("Session key failed to decrypt a command");
+                return self.key_failure(MAX_KEY_FAILURES, SniffError::SessionKeyLost);
             }
         };
+        self.key_failures = 0;
 
-        let key = match key_r {
-            Dispatch(k) | Key::Session(k) => k,
-        };
-
-        command.apply_key(key);
+        command.apply_key(&key);
 
         let span = info_span!("command", ?command);
         let _enter = span.enter();
@@ -476,7 +595,7 @@ impl GameSniffer {
             }
         }
 
-        Some(command)
+        Ok(Some(command))
     }
 
     /// Brute-force the session key from the server's seed.
@@ -503,3 +622,6 @@ impl GameSniffer {
         Some(key)
     }
 }
+
+#[cfg(test)]
+mod tests;
