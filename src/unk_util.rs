@@ -53,21 +53,31 @@ fn decode_base64(bytes: &[u8]) -> Option<Vec<u8>> {
         .ok()
 }
 
-/// Constraints on what may be called an achievement list. Swept across every
-/// response in two 3.2.0 captures these admit exactly the two real packets.
+/// Constraints on what may be called an achievement list.
 ///
 /// The entry floor is strict on purpose: a 37-entry list matched the catalogue
-/// at 81% and a 117-entry one at 97%, so below certainty is not evidence. The
-/// cost is that a patch adding achievements before stardb updates stops
-/// detection rather than returning a partial answer, which is the safer failure.
+/// at 81% and a 117-entry one at 97%, so a near match on a short list is not
+/// evidence.
 const MIN_ENTRIES: usize = 40;
+
+/// How many entries a list must have per id the catalogue does not know.
+///
+/// The game can ship an achievement before stardb lists it, and requiring every
+/// id to be known would then throw the whole list away over a single entry. One
+/// unknown per hundred lets that through while the 117-entry false positive
+/// above, at roughly four unknowns, still fails.
+const ENTRIES_PER_UNKNOWN_ID: usize = 100;
+
+fn max_unknown_ids(entries: usize) -> usize {
+    entries / ENTRIES_PER_UNKNOWN_ID
+}
 
 /// Constants in the descriptor table are all small; unconstrained voting returns
 /// arbitrary large ones such as 10773171, which are always spurious.
 const MAX_XOR_KEY: u64 = 1 << 16;
 
-/// Both lists sit two wrappers deep. The search descends further only so that it
-/// does not depend on that.
+/// How far below the packet root a list may sit. Where the lists sit changes
+/// between builds, so the bound is generous rather than tight.
 const MAX_DEPTH: usize = 6;
 
 /// The achievement ids, plus the arcade subset that tells the two ZZZ
@@ -104,6 +114,19 @@ impl Catalogue {
 
     pub fn is_empty(&self) -> bool {
         self.all.is_empty()
+    }
+
+    /// Whether a decoded list holds what an achievement list would: unique ids,
+    /// nearly all of them known.
+    ///
+    /// A layout found once is reused on later packets, and any message with the
+    /// same tags and at least [`MIN_ENTRIES`] repeats decodes under it, typically
+    /// as a run of id 0 or of ids off the catalogue. Without this check such a
+    /// packet passes for the list.
+    pub fn fits(&self, achievements: &[Achievement]) -> bool {
+        let distinct: HashSet<u32> = achievements.iter().map(|a| a.id).collect();
+        let unknown = distinct.iter().filter(|id| !self.all.contains(id)).count();
+        distinct.len() == achievements.len() && unknown <= max_unknown_ids(achievements.len())
     }
 }
 
@@ -155,9 +178,9 @@ const ARCADE_ELEM: ElemTags = ElemTags {
 };
 
 /// Search a response for an achievement list. Both ZZZ lists are repeated
-/// submessages inside a larger response, the regular one three levels down
-/// (GetMiscDataScRsp.15 -> 1067 -> 10). The walk descends through single
-/// occurrences too, so the deep one is reached.
+/// submessages inside a larger response, at a depth and under tags that change
+/// between builds. The walk descends through single occurrences too, so a list
+/// nested several levels down is still reached.
 pub fn find_achievement_list(body: &[u8], catalogue: &Catalogue) -> Option<AchievementList> {
     let mut best = None;
     walk(body, &mut Vec::new(), 0, catalogue, &mut best);
@@ -241,12 +264,18 @@ fn check_list(elements: &[&[u8]], catalogue: &Catalogue) -> Option<AchievementLi
             continue;
         }
 
+        // Judged on the known ids only, so that an arcade achievement stardb
+        // has not listed yet does not make the arcade list look regular.
+        let arcade = ids
+            .iter()
+            .filter(|id| catalogue.all.contains(id))
+            .all(|id| catalogue.arcade.contains(id));
         let candidate = AchievementList {
             path: Vec::new(),
             list_tag: 0,
             id_tag: *id_tag,
             xor_key,
-            arcade: ids.iter().all(|id| catalogue.arcade.contains(id)),
+            arcade,
             entries: elements.len(),
         };
         if better(&candidate, &best) {
@@ -257,39 +286,51 @@ fn check_list(elements: &[&[u8]], catalogue: &Catalogue) -> Option<AchievementLi
 }
 
 /// Recover the constant applied to a set of observed values: the key below
-/// [`MAX_XOR_KEY`] that maps every one of them onto a catalogue id.
+/// [`MAX_XOR_KEY`] that maps all of them onto catalogue ids, bar the few
+/// [`max_unknown_ids`] allows.
 ///
-/// Every value has to land on an id, so the first value alone narrows the
-/// candidates to one per id, and each is then checked against the rest. That is
-/// linear in the list, where voting over every (observed, id) pair and scoring
-/// each vote was quadratic: seconds per packet on an 800-entry list, during which
-/// the capture backs up.
+/// With at most `k` values off the catalogue, one of the first `k + 1` lands on
+/// an id, so those alone narrow the candidates to `k + 1` per id, and each is
+/// then checked against the rest. That is linear in the list, where voting over
+/// every (observed, id) pair and scoring each vote was quadratic: seconds per
+/// packet on an 800-entry list, during which the capture backs up.
 ///
-/// Among keys that fit, the one landing on the most distinct ids wins, because
-/// the catalogue is dense enough that low-bit keys come close -- key 4 matches
-/// 57 of 65 entries while key 0 matches all 65.
+/// Among keys that fit, the one with the fewest unknowns and then the most
+/// distinct ids wins, because the catalogue is dense enough that low-bit keys
+/// come close -- key 4 matches 57 of 65 entries while key 0 matches all 65.
 fn find_xor_key(observed: &[u64], ids: &HashSet<u32>) -> Option<u64> {
-    let first = *observed.first()?;
+    let allowed = max_unknown_ids(observed.len());
     // Sorted so that a tie goes the same way on every run.
-    let candidates: BTreeSet<u64> = ids
+    let candidates: BTreeSet<u64> = observed
         .iter()
-        .map(|id| first ^ u64::from(*id))
+        .take(allowed + 1)
+        .flat_map(|value| ids.iter().map(move |id| value ^ u64::from(*id)))
         .filter(|key| *key < MAX_XOR_KEY)
         .collect();
 
-    let mut best: Option<(u64, usize)> = None;
-    for key in candidates {
+    // (key, unknown, distinct)
+    let mut best: Option<(u64, usize, usize)> = None;
+    'keys: for key in candidates {
         let mut distinct: HashSet<u32> = HashSet::new();
-        let all_match = observed.iter().all(|observed| {
-            let id = (observed ^ key) as u32;
+        let mut unknown = 0;
+        for value in observed {
+            let id = (value ^ key) as u32;
             distinct.insert(id);
-            ids.contains(&id)
+            if !ids.contains(&id) {
+                unknown += 1;
+                if unknown > allowed {
+                    continue 'keys;
+                }
+            }
+        }
+        let wins = best.map_or(true, |(_, fewest, most)| {
+            unknown < fewest || (unknown == fewest && distinct.len() > most)
         });
-        if all_match && best.map_or(true, |(_, most)| distinct.len() > most) {
-            best = Some((key, distinct.len()));
+        if wins {
+            best = Some((key, unknown, distinct.len()));
         }
     }
-    best.map(|(key, _)| key)
+    best.map(|(key, _, _)| key)
 }
 
 /// Read a list back out of a packet using a layout found earlier.

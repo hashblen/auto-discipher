@@ -446,7 +446,9 @@ impl GameSniffer {
             .flatten()
         {
             if let Some(achievements) = decode_list(&game_command.proto_data, known) {
-                return Some(achievements);
+                if self.catalogue.fits(&achievements) {
+                    return Some(achievements);
+                }
             }
         }
 
@@ -464,6 +466,9 @@ impl GameSniffer {
         );
 
         let achievements = decode_list(&game_command.proto_data, &list)?;
+        if !self.catalogue.fits(&achievements) {
+            return None;
+        }
         if list.arcade {
             self.arcade_list = Some(list);
         } else {
