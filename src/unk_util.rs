@@ -12,10 +12,18 @@ use crate::gen::protos::Unk;
 pub struct Achievement {
     pub id: u32,
     pub progress: u32,
-    /// `finished` in the regular list, `completed` in the arcade one. The arcade
-    /// list's `unlocked` is set on every entry, so it says nothing about whether
-    /// the achievement was earned.
+    /// Whether the achievement was earned, its reward claimed or not.
+    ///
+    /// In the regular list this is a finish time or the reward flag: the flag
+    /// is only set once the reward is taken, so an achievement finished but not
+    /// yet claimed has the time alone. In the arcade list it is a nonzero
+    /// status: 1 once finished, 2 once the reward is claimed. That list's
+    /// `unlocked` is set on every entry, so it says nothing about whether the
+    /// achievement was earned.
     pub completed: bool,
+    /// When the achievement was finished, as Unix seconds. Only the regular list
+    /// carries it.
+    pub finish_timestamp: Option<u32>,
 }
 
 /// Find `server_rand_key` by RSA round-trip: a real blob decrypts to exactly 8
@@ -164,16 +172,24 @@ impl AchievementList {
 /// upstream descriptor table. A zero tag is one that list does not have.
 struct ElemTags {
     progress: u32,
+    /// Set once the achievement is finished, whether or not its reward was
+    /// taken.
+    finish_time: u32,
+    /// Nonzero once earned. In the regular list a flag set only once the reward
+    /// is claimed; in the arcade one a status, 1 when finished and 2 when
+    /// claimed.
     completed: u32,
 }
 
 const REGULAR_ELEM: ElemTags = ElemTags {
     progress: 2,
+    finish_time: 3,
     completed: 4,
 };
 
 const ARCADE_ELEM: ElemTags = ElemTags {
     progress: 14,
+    finish_time: 0,
     completed: 15,
 };
 
@@ -370,10 +386,15 @@ pub fn decode_list(body: &[u8], list: &AchievementList) -> Option<Vec<Achievemen
                 achievement.id = (value ^ list.xor_key) as u32;
             } else if tag == tags.progress {
                 achievement.progress = value as u32;
+            } else if tag == tags.finish_time {
+                achievement.finish_timestamp = (value != 0).then_some(value as u32);
             } else if tag == tags.completed {
                 achievement.completed = value != 0;
             }
         }
+        // A finished achievement whose reward is still waiting has a finish time
+        // but no flag, and is just as earned.
+        achievement.completed |= achievement.finish_timestamp.is_some();
         achievements.push(achievement);
     }
 

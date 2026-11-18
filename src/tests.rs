@@ -139,3 +139,89 @@ fn a_reset_keeps_the_initial_keys() {
     assert_eq!(sniffer.server_seed, 0);
     assert_eq!(receive(&mut sniffer, &good()), Ok(true));
 }
+
+fn varint(mut value: u64, out: &mut Vec<u8>) {
+    while value >= 0x80 {
+        out.push(value as u8 | 0x80);
+        value >>= 7;
+    }
+    out.push(value as u8);
+}
+
+/// A regular list entry: the varint fields given, under the regular tags.
+fn regular_entry(fields: &[(u32, u64)]) -> Vec<u8> {
+    let mut entry = Vec::new();
+    for (tag, value) in fields {
+        varint(u64::from(tag << 3), &mut entry);
+        varint(*value, &mut entry);
+    }
+    entry
+}
+
+#[test]
+fn a_finished_achievement_counts_before_its_reward_is_claimed() {
+    // Seen on 1003037: finished, reward not yet taken, so the finish time (3) is
+    // there and the claimed flag (4) is not.
+    let unclaimed = regular_entry(&[(1, 1003037), (3, 1794995749)]);
+    let claimed = regular_entry(&[(1, 1003001), (3, 1742057521), (4, 1)]);
+    let in_progress = regular_entry(&[(1, 2002048), (2, 38)]);
+
+    let mut body = Vec::new();
+    let mut entries = vec![unclaimed, claimed, in_progress];
+    entries.extend((0..40).map(|i| regular_entry(&[(1, 1_000_000 + i)])));
+    for entry in &entries {
+        varint(2 << 3 | 2, &mut body);
+        varint(entry.len() as u64, &mut body);
+        body.extend_from_slice(entry);
+    }
+
+    let list = AchievementList {
+        path: Vec::new(),
+        list_tag: 2,
+        id_tag: 1,
+        xor_key: 0,
+        arcade: false,
+        entries: entries.len(),
+    };
+    let achievements = decode_list(&body, &list).unwrap();
+
+    assert!(achievements[0].completed);
+    assert_eq!(achievements[0].finish_timestamp, Some(1794995749));
+    assert!(achievements[1].completed);
+    assert!(!achievements[2].completed);
+    assert_eq!(achievements[2].progress, 38);
+    assert_eq!(achievements[2].finish_timestamp, None);
+}
+
+#[test]
+fn an_arcade_achievement_counts_before_its_reward_is_claimed() {
+    // Seen on 10003: the status (15) is 1 until the reward is taken, then 2.
+    let xor_key = 6797;
+    let unclaimed = regular_entry(&[(2, 1), (7, 10003 ^ xor_key), (15, 1)]);
+    let claimed = regular_entry(&[(2, 1), (7, 10004 ^ xor_key), (15, 2)]);
+    let unfinished = regular_entry(&[(2, 1), (7, 10005 ^ xor_key)]);
+
+    let mut body = Vec::new();
+    let mut entries = vec![unclaimed, claimed, unfinished];
+    entries.extend((0..40).map(|i| regular_entry(&[(2, 1), (7, (20_000 + i) ^ xor_key)])));
+    for entry in &entries {
+        varint(11 << 3 | 2, &mut body);
+        varint(entry.len() as u64, &mut body);
+        body.extend_from_slice(entry);
+    }
+
+    let list = AchievementList {
+        path: Vec::new(),
+        list_tag: 11,
+        id_tag: 7,
+        xor_key,
+        arcade: true,
+        entries: entries.len(),
+    };
+    let achievements = decode_list(&body, &list).unwrap();
+
+    assert_eq!(achievements[0].id, 10003);
+    assert!(achievements[0].completed);
+    assert!(achievements[1].completed);
+    assert!(!achievements[2].completed);
+}
